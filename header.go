@@ -8,7 +8,7 @@ import (
 	"errors"
 )
 
-const mxEthernet = 0x4f3e
+const lpcapmx = 0x4f3e
 const minFileSize = 14
 const minPacketSize = 10
 
@@ -24,7 +24,7 @@ func unmarshalFileHeader(b []byte) (*fileHeader, int64, error) {
 	erroffset := int64(0)
 	h := &fileHeader{}
 	mx := binary.LittleEndian.Uint16(b)
-	if mx != mxEthernet {
+	if mx != lpcapmx {
 		return nil, erroffset, errors.New("cannot parse PCAP file, invalid magix number")
 	}
 	h.mx = mx

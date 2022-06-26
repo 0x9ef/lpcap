@@ -85,7 +85,7 @@ func Create(path string) (*PCAP, error) {
 
 	p := &PCAP{
 		h: &fileHeader{
-			mx:       mxEthernet,
+			mx:       lpcapmx,
 			majorVer: MajorVer,
 			minorVer: MinorVer,
 			snapLen:  MaxSnapLength,
@@ -94,6 +94,7 @@ func Create(path string) (*PCAP, error) {
 		fd:      f,
 		len:     0,
 		offset:  0,
+		lasterr: ErrOk,
 		mx:      new(sync.RWMutex),
 		closeMx: new(sync.Mutex),
 	}
