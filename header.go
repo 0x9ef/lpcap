@@ -29,15 +29,7 @@ func unmarshalFileHeader(b []byte) (*fileHeader, int64, error) {
 	}
 	h.mx = mx
 	h.majorVer = binary.LittleEndian.Uint16(b[2:])
-	if h.majorVer == 0 {
-		erroffset += 2
-		return nil, erroffset, errors.New("cannot parse PCAP file, invalid major version (is nil)")
-	}
 	h.minorVer = binary.LittleEndian.Uint16(b[4:])
-	if h.minorVer == 0 {
-		erroffset += 4
-		return nil, erroffset, errors.New("cannot parse PCAP file, invalid minor version (is nil)")
-	}
 	h.snapLen = binary.LittleEndian.Uint32(b[6:])
 	linkType := LinkType(binary.LittleEndian.Uint32(b[10:]))
 	if linkType != LinkTypeEthernet2 && linkType != LinkTypeEthernet80211 {
@@ -59,7 +51,7 @@ func unmarshalPacketHeader(b []byte, maxLen uint32) (*packetHeader, int64, error
 	erroffset := int64(0)
 	h := &packetHeader{}
 	i, pt := b[0], b[1]
-	if pt != PtypeBroadcast && pt != PtypeUnicast && pt != PtypeMulticast {
+	if pt != PacketTypeBroadcast && pt != PacketTypeUnicast && pt != PacketTypeMulticast {
 		return nil, erroffset, errors.New("undefined packet type")
 	}
 	t := binary.LittleEndian.Uint32(b[2:])

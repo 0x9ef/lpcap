@@ -15,13 +15,21 @@ import (
 const MajorVer = 1
 const MinorVer = 0
 
+type ReaderWriterCloser interface {
+	io.Reader
+	io.ReaderAt
+	io.Writer
+	io.Closer
+}
+
 // A file format that contains captured packet data for further
 // playback and tracing. Notice: It does not have any compatibility with the real PCAP format.
 // The simplified version of PCAP described here
-//   https://tools.ietf.org/id/draft-gharris-opsawg-pcap-00.html
+//
+//	https://tools.ietf.org/id/draft-gharris-opsawg-pcap-00.html
 type PCAP struct {
 	h        *fileHeader
-	fd       *os.File
+	rd       ReaderWriterCloser
 	len      int32 // count of total packets
 	offset   int64 // read offset of PCAP file
 	isClosed bool
@@ -35,16 +43,12 @@ type PCAP struct {
 type Packet struct {
 	// Interface index where frame was received
 	Index uint8
-
 	// Broadcast/Unicast/Multicast
 	PacketType uint8
-
 	// Represents the number of nanoseconds that have elapsed since 1970-01-01 00:00:00 UTC
 	Timestamp uint32
-
 	// Original length of captured packet
 	Len uint32
-
 	// Raw packet data
 	Data []byte
 }
@@ -69,10 +73,16 @@ const (
 const MaxSnapLength = 1<<14 - 1
 
 const (
-	PtypeBroadcast = 2 << iota // broadcast packet type
-	PtypeUnicast               // unicast packet type
-	PtypeMulticast             // multicast packet type
+	PacketTypeBroadcast = 2 << iota // broadcast packet type
+	PacketTypeUnicast               // unicast packet type
+	PacketTypeMulticast             // multicast packet type
 )
+
+var packetPool = &sync.Pool{
+	New: func() any {
+		return make([]byte, 0, MaxSnapLength)
+	},
+}
 
 // Creates a PCAP file on the specified path,
 // writes the first 14 bytes of the file header and returns the PCAP
@@ -91,7 +101,7 @@ func Create(path string) (*PCAP, error) {
 			snapLen:  MaxSnapLength,
 			link:     LinkTypeEthernet2,
 		},
-		fd:      f,
+		rd:      f,
 		len:     0,
 		offset:  0,
 		lasterr: ErrOk,
@@ -105,10 +115,11 @@ func Create(path string) (*PCAP, error) {
 	binary.LittleEndian.PutUint16(b[4:], p.h.minorVer)
 	binary.LittleEndian.PutUint32(b[6:], p.h.snapLen)
 	binary.LittleEndian.PutUint32(b[10:], uint32(p.h.link))
-	if n, err := f.Write(b); err != nil && n == 0 {
+	n, err := f.Write(b)
+	if err != nil {
 		return nil, err
 	}
-	p.offset = minFileSize
+	p.offset += int64(n)
 	p.fsize = minFileSize
 	return p, nil
 }
@@ -133,7 +144,8 @@ func Open(path string) (*PCAP, error) {
 
 	// read first 14 file header bytes and then unmarshal and parse
 	b := make([]byte, minFileSize)
-	if n, err := f.ReadAt(b, 0); n == 0 && err != nil {
+	n, err := f.ReadAt(b, 0)
+	if err != nil {
 		return nil, err
 	}
 
@@ -145,9 +157,9 @@ func Open(path string) (*PCAP, error) {
 
 	pcap := &PCAP{
 		h:       header,
-		fd:      f,
+		rd:      f,
 		len:     0,
-		offset:  minFileSize,
+		offset:  int64(n),
 		fsize:   fileSize,
 		mx:      new(sync.RWMutex),
 		closeMx: new(sync.Mutex),
@@ -155,24 +167,14 @@ func Open(path string) (*PCAP, error) {
 	return pcap, nil
 }
 
-// Next return true if current readed offset less than summary file length
-func (pcap *PCAP) Next() bool {
-	pcap.mx.RLock()
-	hasNext := pcap.offset < pcap.fsize
-	pcap.mx.RUnlock()
-	return hasNext
-}
-
 // Reads packet header from the current offset.
 // Reads first 12 bytes of packet header, determines frame size, checks timestamp,
 // then reads file to size specified in packet header.
 func (pcap *PCAP) ReadPacket(p *Packet) (n int, err error) {
-	if p == nil {
-		return 0, errors.New("cannot unmarshal to nullable packet frame")
-	}
-
-	b := make([]byte, minPacketSize)
-	n, err = pcap.fd.ReadAt(b, atomic.LoadInt64(&pcap.offset))
+	b := packetPool.Get().([]byte)
+	b = b[:0]
+	b = b[:minPacketSize]
+	n, err = pcap.rd.ReadAt(b, atomic.LoadInt64(&pcap.offset))
 	if err != nil {
 		if err == io.EOF {
 			pcap.lasterr = ErrNoMorePacket
@@ -181,8 +183,9 @@ func (pcap *PCAP) ReadPacket(p *Packet) (n int, err error) {
 		}
 		return 0, err
 	}
-
 	atomic.AddInt64(&pcap.offset, int64(n))
+
+	// Unmarshal packet header with maximum snap length
 	h, erroffset, err := unmarshalPacketHeader(b, pcap.h.snapLen)
 	if err != nil {
 		erroffset += atomic.LoadInt64(&pcap.offset)
@@ -190,8 +193,8 @@ func (pcap *PCAP) ReadPacket(p *Packet) (n int, err error) {
 		return 0, &ParseError{Offset: erroffset, Err: err}
 	}
 
-	b = make([]byte, h.len)
-	n, err = pcap.fd.ReadAt(b, atomic.LoadInt64(&pcap.offset))
+	b = b[:h.len]
+	n, err = pcap.rd.ReadAt(b, atomic.LoadInt64(&pcap.offset))
 	if err != nil {
 		if err == io.EOF {
 			pcap.lasterr = ErrNoMorePacket
@@ -200,6 +203,7 @@ func (pcap *PCAP) ReadPacket(p *Packet) (n int, err error) {
 		}
 		return 0, err
 	}
+	packetPool.Put(b)
 
 	*p = Packet{
 		Index:      h.ifindex,
@@ -215,38 +219,41 @@ func (pcap *PCAP) ReadPacket(p *Packet) (n int, err error) {
 
 // Writes timestamp, data into a PacketHeader structure and then into
 // a byte array. Writes the data to a file and flushes it.
-func (pcap *PCAP) WritePacket(p *Packet) (n int, err error) {
+func (pcap *PCAP) WritePacket(p Packet) (n int, err error) {
 	isOverflow := len(p.Data)+minPacketSize > int(pcap.h.snapLen)
 	if isOverflow {
 		pcap.lasterr = ErrSizeOverflow
 		return 0, errors.New("cannot write packet to PCAP, because length of packet greater than snap length")
 	}
 
-	h := &packetHeader{
-		ifindex:   p.Index,
-		ptype:     p.PacketType,
-		timestamp: p.Timestamp,
-		len:       p.Len,
-		p:         p.Data,
-	}
-
 	offset := 0
-	b := make([]byte, minPacketSize+h.len)
-	b[0] = h.ifindex
-	b[1] = h.ptype
+	b := packetPool.Get().([]byte)
+	b = b[:0]
+	b = b[:minPacketSize+p.Len]
+	b[0] = p.Index
+	b[1] = p.PacketType
 	offset += 2
-	binary.LittleEndian.PutUint32(b[offset:], h.timestamp)
+	binary.LittleEndian.PutUint32(b[offset:], p.Timestamp)
 	offset += 4
-	binary.LittleEndian.PutUint32(b[offset:], h.len)
+	binary.LittleEndian.PutUint32(b[offset:], p.Len)
 	offset += 4
-	copy(b[offset:], h.p)
-	n, err = pcap.fd.Write(b)
-	if err != nil && n == 0 {
+	copy(b[offset:], p.Data)
+	n, err = pcap.rd.Write(b)
+	if err != nil {
 		pcap.lasterr = ErrWrite
 		return 0, err
 	}
 	atomic.AddInt64(&pcap.fsize, int64(n))
+	packetPool.Put(b)
 	return n, err
+}
+
+// Next return true if current readed offset less than summary file length
+func (pcap *PCAP) Next() bool {
+	pcap.mx.RLock()
+	hasNext := pcap.offset < pcap.fsize
+	pcap.mx.RUnlock()
+	return hasNext
 }
 
 // Close clears the fields and then closes the file descriptor
@@ -262,7 +269,7 @@ func (pcap *PCAP) Close() error {
 	pcap.isClosed = true
 	pcap.lasterr = ErrOk
 	pcap.fsize = 0
-	err := pcap.fd.Close()
+	err := pcap.rd.Close()
 	return err
 }
 
